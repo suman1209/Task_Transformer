@@ -149,9 +149,14 @@ class PolygonModel(nn.Module):
                                                         nhead=4)
         self.decoder = nn.TransformerDecoder(self.decoder_layer, num_layers=6)
 
-        # MLP heads
-        self.coord_head = nn.Linear(self.d_model, 2)  # Predict x, y coordinates
-        self.pre_exists_head = nn.Linear(self.d_model, 1)  # Predict presence/absence
+        # MLP heads 
+        # Predict x, y coordinates
+        self.coord_head = nn.Linear(self.d_model, 2)  
+        # Predict presence/absence
+        self.pred_exists_head = nn.Sequential(
+            nn.Linear(self.d_model, 1),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
         B = x.size(0)
@@ -179,8 +184,33 @@ class PolygonModel(nn.Module):
         pred_coords = self.coord_head(trans_queries)
         # Predict presence/absence
         # Shape: (batch_size, 4, 1)
-        pred_exists = self.pre_exists_head(trans_queries)
-        return pred_coords, pred_exists
+        pred_exists = self.pred_exists_head(trans_queries)
+        # Apply sorting to predicted points
+        pred_coords_sorted = self.sort_points_clockwise_batched(pred_coords)
+
+        return pred_coords_sorted, pred_exists
+    
+    def sort_points_clockwise_batched(self, coords):
+        """
+        Sort points in clockwise order for each batch to form proper polygons.
+        Args:
+            coords: Tensor of shape (batch_size, num_points, 2), where each row is (x, y).
+        Returns:
+            Tensor of shape (batch_size, num_points, 2), sorted in clockwise order.
+        """
+
+        # Compute the centroid for each batch
+        centroids = coords.mean(dim=1, keepdim=True)  # Shape: (batch_size, 1, 2)
+
+        # Compute angles of each point relative to the centroid
+        angles = torch.atan2(coords[:, :, 1] - centroids[:, :, 1], coords[:, :, 0] - centroids[:, :, 0])  # Shape: (batch_size, num_points)
+
+        # Sort points by angle for each batch
+        sorted_indices = torch.argsort(angles, dim=1)  # Shape: (batch_size, num_points)
+        sorted_coords = torch.gather(coords, dim=1, index=sorted_indices.unsqueeze(-1).expand(-1, -1, 2))
+
+        return sorted_coords
+
     # ADD CODE HERE #
     pass
 
@@ -212,9 +242,15 @@ def compute_loss(pred_coords, pred_exists, gt_coords, lengths):
         # Compute cost matrix for matching (Euclidean distance)
         cost_matrix = torch.cdist(pred_coords_b, gt_coords_b, p=2)  # Shape: (num_pred, num_gt_points)
 
+        if torch.isnan(cost_matrix).any() or torch.isinf(cost_matrix).any():
+            print("Invalid values detected in cost_matrix!")
+            print(cost_matrix)
+            breakpoint()
+            raise ValueError("Cost matrix contains NaN or Inf values.")
+
         # Solve the assignment problem using the Hungarian algorithm
         row_indices, col_indices = linear_sum_assignment(cost_matrix.cpu().detach().numpy())
-
+        
         # Match predictions to ground truth
         matched_preds = pred_coords_b[row_indices]  # Shape: (num_gt_points, 2)
         matched_gts = gt_coords_b[col_indices]  # Shape: (num_gt_points, 2)
@@ -231,7 +267,7 @@ def compute_loss(pred_coords, pred_exists, gt_coords, lengths):
     presence_loss /= batch_size
 
     # Combine the losses
-    total_loss = coord_loss + presence_loss
+    total_loss = coord_loss + 0.1*presence_loss
     return total_loss
     # ADD CODE HERE #
     pass
@@ -291,7 +327,6 @@ def main():
                     pred_coords, pred_exists = model(imgs)
                     pred_coords *= IMG_SIZE
                     coords = [co.view(-1, 2) for co in coords]
-                    # torch.tensor([gt_coords_b.view(-1, 2) for gt_coords_b in coords]  # Shape: (num_gt_points, 2)
                     # ADD CODE HERE #
 
                     save_path = f"predictions/{i:03d}.png"
