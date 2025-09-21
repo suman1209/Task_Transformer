@@ -85,7 +85,7 @@ class Net(nn.Module):
         solve the task, the sequence order does not matter, but the model has
         to somehow know that the first two elements are special, we cannot do 
         this using vanilla fixed trignometric position encoding, so its a good
-        idea to make the position encoding trainable, so that the model can 
+        idea to make the position encoding learnable, so that the model can 
         learn the task specific details.
         """
         # Can you think of another similar task where the positional encoding
@@ -201,6 +201,11 @@ class MultiHeadAttention(nn.Module):
         # TODO: Add necessary member variables.
         self.num_heads = num_heads
         self.embed_dim = embed_dim
+        # Create separate attention heads
+        self.attention_heads = nn.ModuleList([
+            Attention(input_dim=embed_dim, embed_dim=embed_dim) 
+            for _ in range(num_heads)
+        ])
         self.W_O = nn.Linear(embed_dim*num_heads, embed_dim)
         ########################################################################
 
@@ -220,11 +225,9 @@ class MultiHeadAttention(nn.Module):
         """
         batch_size = q.size(0)
         # in this task, dq=dk=dv
-        input_dim = q.size(-1)
         heads = []
-        attention = Attention(input_dim=input_dim, embed_dim=self.embed_dim)
-        for _ in range(self.num_heads):
-            heads.append(attention(q, k, v))
+        for attention_head in self.attention_heads:
+            heads.append(attention_head(q, k, v))
         # concatenation
         result = torch.cat(heads, dim=-1)
         # linear projection

@@ -20,7 +20,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from shapely.geometry import Polygon
 from torchvision import models
-from scipy.optimize import linear_sum_assignment
+from scipy.optimize import linear_sum_assignment as lsa
 
 # ----- Config - DO NOT CHANGE THIS ----- #
 EPOCHS = 800
@@ -104,8 +104,8 @@ class PolygonDataset(Dataset):
             transforms.ToTensor(),
         ])
         self.images = [self.transform(img) for img in self.images]
-        self.targets = [torch.tensor(gt, dtype=torch.float32) / IMG_SIZE for gt in self.targets
-        ]
+        self.targets = [torch.tensor(gt, dtype=torch.float32) / IMG_SIZE
+                        for gt in self.targets]
         # ADD CODE HERE #
 
     def __len__(self):
@@ -137,16 +137,17 @@ class PolygonModel(nn.Module):
         self.feature_extractor = models.squeezenet1_0(pretrained=True).features
         # since given images are grayscale (1 channel), conversion to RGB 
         self.gray_to_rgb = nn.Conv2d(1, 3, kernel_size=1)
-        self.channel_reducer = nn.Conv2d(512, 64, kernel_size=1)
+        self.channel_reducer = nn.Conv2d(512, self.d_model, kernel_size=1)
         self.positional_encoding = nn.Parameter(torch.zeros(49, self.d_model))
-        self.encoder_layer = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=4)
+        self.encoder_layer = nn.TransformerEncoderLayer(d_model=self.d_model,
+                                                        nhead=8)
         self.encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=6)
 
         # Learnable queries
         self.queries = nn.Parameter(torch.randn(4, self.d_model))
         # Decoder layer
         self.decoder_layer = nn.TransformerDecoderLayer(d_model=self.d_model,
-                                                        nhead=4)
+                                                        nhead=8)
         self.decoder = nn.TransformerDecoder(self.decoder_layer, num_layers=6)
 
         # MLP heads 
@@ -194,20 +195,21 @@ class PolygonModel(nn.Module):
         """
         Sort points in clockwise order for each batch to form proper polygons.
         Args:
-            coords: Tensor of shape (batch_size, num_points, 2), where each row is (x, y).
+            coords: Tensor (batch_size, num_points, 2).
         Returns:
-            Tensor of shape (batch_size, num_points, 2), sorted in clockwise order.
+            Tensor (batch_size, num_points, 2), sorted in clockwise order.
         """
 
         # Compute the centroid for each batch
-        centroids = coords.mean(dim=1, keepdim=True)  # Shape: (batch_size, 1, 2)
-
+        # Shape: (batch_size, 1, 2)
+        centroids = coords.mean(dim=1, keepdim=True)
         # Compute angles of each point relative to the centroid
-        angles = torch.atan2(coords[:, :, 1] - centroids[:, :, 1], coords[:, :, 0] - centroids[:, :, 0])  # Shape: (batch_size, num_points)
-
+        angles = torch.atan2(coords[:, :, 1] - centroids[:, :, 1],
+                             coords[:, :, 0] - centroids[:, :, 0]) 
         # Sort points by angle for each batch
-        sorted_indices = torch.argsort(angles, dim=1)  # Shape: (batch_size, num_points)
-        sorted_coords = torch.gather(coords, dim=1, index=sorted_indices.unsqueeze(-1).expand(-1, -1, 2))
+        sorted_indices = torch.argsort(angles, dim=1)
+        sorted_coords = torch.gather(coords, dim=1,
+                                     index=sorted_indices.unsqueeze(-1).expand(-1, -1, 2))
 
         return sorted_coords
 
@@ -240,7 +242,8 @@ def compute_loss(pred_coords, pred_exists, gt_coords, lengths):
         gt_coords_b = gt_coords_b.view(-1, 2)  # Shape: (num_gt_points, 2)
         num_gt_points = lengths[b]  # Number of ground truth points
         # Compute cost matrix for matching (Euclidean distance)
-        cost_matrix = torch.cdist(pred_coords_b, gt_coords_b, p=2)  # Shape: (num_pred, num_gt_points)
+        # Shape: (num_pred, num_gt_points)
+        cost_matrix = torch.cdist(pred_coords_b, gt_coords_b, p=2)
 
         if torch.isnan(cost_matrix).any() or torch.isinf(cost_matrix).any():
             print("Invalid values detected in cost_matrix!")
@@ -249,7 +252,7 @@ def compute_loss(pred_coords, pred_exists, gt_coords, lengths):
             raise ValueError("Cost matrix contains NaN or Inf values.")
 
         # Solve the assignment problem using the Hungarian algorithm
-        row_indices, col_indices = linear_sum_assignment(cost_matrix.cpu().detach().numpy())
+        row_indices, col_indices = lsa(cost_matrix.cpu().detach().numpy())
         
         # Match predictions to ground truth
         matched_preds = pred_coords_b[row_indices]  # Shape: (num_gt_points, 2)
@@ -258,8 +261,9 @@ def compute_loss(pred_coords, pred_exists, gt_coords, lengths):
         # Coordinate loss (MSE between matched predictions and ground truth)
         coord_loss += F.mse_loss(matched_preds, matched_gts)
 
-        # Presence loss (MSE between predicted presence sum and ground truth length)
-        gt_len = torch.tensor(num_gt_points, device=pred_exists.device, dtype=torch.float)
+        # Presence loss (MSE between predicted presence sum and gt length)
+        gt_len = torch.tensor(num_gt_points, device=pred_exists.device,
+                              dtype=torch.float)
         presence_loss += F.mse_loss(pred_exists_b.sum(0), gt_len)
 
     # Average losses over the batch
