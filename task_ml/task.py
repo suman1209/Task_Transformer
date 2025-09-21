@@ -19,6 +19,8 @@ from torchvision import transforms
 from PIL import Image
 import matplotlib.pyplot as plt
 from shapely.geometry import Polygon
+from torchvision import models
+from scipy.optimize import linear_sum_assignment
 
 # ----- Config - DO NOT CHANGE THIS ----- #
 EPOCHS = 800
@@ -66,7 +68,6 @@ def plot_and_iou(img, pred_coords, gt_coords, save_path=None):
     axes[1].set_title(f"GT vs Pred | IOU: {iou:.2f}")
     axes[1].legend()
     axes[1].axis('off')
-
     plt.tight_layout()
     plt.savefig(save_path, bbox_inches='tight')
     plt.close()
@@ -97,6 +98,14 @@ class PolygonDataset(Dataset):
         self.targets = data["target"]
 
         # ADD CODE HERE #
+        self.transform = transform if transform else transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((IMG_SIZE, IMG_SIZE)),
+            transforms.ToTensor(),
+        ])
+        self.images = [self.transform(img) for img in self.images]
+        self.targets = [torch.tensor(gt, dtype=torch.float32) / IMG_SIZE for gt in self.targets
+        ]
         # ADD CODE HERE #
 
     def __len__(self):
@@ -104,12 +113,17 @@ class PolygonDataset(Dataset):
 
     def __getitem__(self, idx):
         # ADD CODE HERE #
+        return self.images[idx], self.targets[idx]
         # ADD CODE HERE #
         pass
 
 # ----- Collate Function ----- #
 def collate_fn(batch):
     # ADD CODE HERE #
+    imgs, coords = zip(*batch)
+    imgs = torch.stack([img for img in imgs], dim=0)
+    lengths = [len(c) for c in coords]
+    return imgs, coords, lengths
     # ADD CODE HERE #
     pass
 
@@ -117,12 +131,108 @@ def collate_fn(batch):
 # ----- Model -----
 class PolygonModel(nn.Module):
     # ADD CODE HERE #
+    def __init__(self):
+        super(PolygonModel, self).__init__()
+        self.d_model = 64
+        self.feature_extractor = models.squeezenet1_0(pretrained=True).features
+        # since given images are grayscale (1 channel), conversion to RGB 
+        self.gray_to_rgb = nn.Conv2d(1, 3, kernel_size=1)
+        self.channel_reducer = nn.Conv2d(512, 64, kernel_size=1)
+        self.positional_encoding = nn.Parameter(torch.zeros(49, self.d_model))
+        self.encoder_layer = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=4)
+        self.encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=6)
+
+        # Learnable queries
+        self.queries = nn.Parameter(torch.randn(4, self.d_model))
+        # Decoder layer
+        self.decoder_layer = nn.TransformerDecoderLayer(d_model=self.d_model,
+                                                        nhead=4)
+        self.decoder = nn.TransformerDecoder(self.decoder_layer, num_layers=6)
+
+        # MLP heads
+        self.coord_head = nn.Linear(self.d_model, 2)  # Predict x, y coordinates
+        self.pre_exists_head = nn.Linear(self.d_model, 1)  # Predict presence/absence
+
+    def forward(self, x):
+        B = x.size(0)
+        # Convert grayscale to RGB
+        x = self.gray_to_rgb(x)
+        
+        img_features = self.feature_extractor(x)
+        img_features = self.channel_reducer(img_features)
+        # Squash the spatial dimensions to form a sequence input for transfomer
+        # (batch_size, sequence_length(spatial dimensions), input_dim(channels)
+        B, C, H, W = img_features.shape
+        tokenized_img_feats = img_features.view(B, H * W, C)
+        # add positional encoding
+        tokenized_img_feats += self.positional_encoding.unsqueeze(0)
+        # transformed_img_features
+        trans_img_feats = self.encoder(tokenized_img_feats).permute(1, 0, 2)
+
+        # Expand queries for the batch (batch_size, 4, 512)
+        queries = self.queries.unsqueeze(0).expand(B, -1, -1)
+        queries = queries.permute(1, 0, 2)
+        # Decode using the queries and encoder output
+        trans_queries = self.decoder(queries, trans_img_feats).permute(1, 0, 2)
+        # Predict x, y coordinates
+        # Shape: (batch_size, 4, 2)
+        pred_coords = self.coord_head(trans_queries)
+        # Predict presence/absence
+        # Shape: (batch_size, 4, 1)
+        pred_exists = self.pre_exists_head(trans_queries)
+        return pred_coords, pred_exists
     # ADD CODE HERE #
     pass
 
 # ----- Loss -----
 def compute_loss(pred_coords, pred_exists, gt_coords, lengths):
     # ADD CODE HERE #
+    """
+    Compute the loss for the model.
+    Args:
+        pred_coords: Tensor of shape (batch_size, num_queries, 2), predicted coordinates.
+        pred_exists: Tensor of shape (batch_size, num_queries, 1), predicted presence/absence.
+        gt_coords: List of Tensors, each of shape (num_gt_points, 2), ground truth coordinates.
+        lengths: List of integers, number of ground truth points for each sample in the batch.
+    Returns:
+        total_loss: Combined loss (coordinate loss + presence loss).
+    """
+    batch_size, num_queries, _ = pred_coords.shape
+    coord_loss = 0.0
+    presence_loss = 0.0
+
+    for b in range(batch_size):
+        # Extract predictions and ground truth for the current batch
+        pred_coords_b = pred_coords[b]  # Shape: (num_preds, 2)
+        pred_exists_b = pred_exists[b].squeeze(-1)  # Shape: (num_queries,)
+        gt_coords_b = gt_coords[b] 
+        # Reshape ground truth into (num_gt_points, 2)
+        gt_coords_b = gt_coords_b.view(-1, 2)  # Shape: (num_gt_points, 2)
+        num_gt_points = lengths[b]  # Number of ground truth points
+        # Compute cost matrix for matching (Euclidean distance)
+        cost_matrix = torch.cdist(pred_coords_b, gt_coords_b, p=2)  # Shape: (num_pred, num_gt_points)
+
+        # Solve the assignment problem using the Hungarian algorithm
+        row_indices, col_indices = linear_sum_assignment(cost_matrix.cpu().detach().numpy())
+
+        # Match predictions to ground truth
+        matched_preds = pred_coords_b[row_indices]  # Shape: (num_gt_points, 2)
+        matched_gts = gt_coords_b[col_indices]  # Shape: (num_gt_points, 2)
+
+        # Coordinate loss (MSE between matched predictions and ground truth)
+        coord_loss += F.mse_loss(matched_preds, matched_gts)
+
+        # Presence loss (MSE between predicted presence sum and ground truth length)
+        gt_len = torch.tensor(num_gt_points, device=pred_exists.device, dtype=torch.float)
+        presence_loss += F.mse_loss(pred_exists_b.sum(0), gt_len)
+
+    # Average losses over the batch
+    coord_loss /= batch_size
+    presence_loss /= batch_size
+
+    # Combine the losses
+    total_loss = coord_loss + presence_loss
+    return total_loss
     # ADD CODE HERE #
     pass
 
@@ -149,9 +259,12 @@ def main():
         total_loss = 0.
 
         # ADD CODE HERE #
-        for imgs, _ in train_loader:
-            
-            loss = compute_loss()
+
+        for imgs, gt_coords, lengths in train_loader:
+            imgs = imgs.to(DEVICE)
+            gt_coords = [c.to(DEVICE) for c in gt_coords]
+            pred_coords, pred_exists = model(imgs)
+            loss = compute_loss(pred_coords, pred_exists, gt_coords, lengths)
             # ADD CODE HERE #
 
             optimizer.zero_grad()
@@ -173,7 +286,12 @@ def main():
                     coords = [c.to(DEVICE) for c in coords]
                     
                     # ADD CODE HERE #
-                    pred_coords = None
+                    
+                    coords = [co*IMG_SIZE for co in coords]
+                    pred_coords, pred_exists = model(imgs)
+                    pred_coords *= IMG_SIZE
+                    coords = [co.view(-1, 2) for co in coords]
+                    # torch.tensor([gt_coords_b.view(-1, 2) for gt_coords_b in coords]  # Shape: (num_gt_points, 2)
                     # ADD CODE HERE #
 
                     save_path = f"predictions/{i:03d}.png"

@@ -1,0 +1,16 @@
+[project]
+name = "task-transformer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "commitizen>=4.9.1",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.6",
+    "numpy>=2.3.3",
+    "scipy>=1.16.2",
+    "shapely>=2.1.1",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+]
